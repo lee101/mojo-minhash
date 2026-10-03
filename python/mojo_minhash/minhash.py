@@ -53,19 +53,31 @@ def generate_hash_funcs(count: int, prime: int = PRIME, seed=None):
     `(coeffs[2n - 1 - 2i], coeffs[2n - 2 - 2i])`. Pass `seed` for a
     reproducible draw; the reference uses the global `random` module, and it
     also writes the draw to `coeffs.json`, which this does not do.
+
+    `prime` is accepted for signature compatibility with the reference and
+    validated, but it does not reach the returned pairs: the coefficients are a
+    plain `random.sample` in both implementations and are independent of the
+    modulus. `calculate_signature` always reduces mod `mojo_minhash.PRIME`.
     """
     if count < 1:
         raise ValueError("count must be >= 1")
+    if not 0 < prime < 2**33:
+        raise ValueError("prime must fit in 33 bits for the limb reduction")
     rng = random.Random(seed) if seed is not None else random
     coeffs = rng.sample(range(2**32 - 1), count * 2)
     return [(coeffs.pop(), coeffs.pop()) for _ in range(count)]
 
 
 def calculate_signature(shingles, hash_funcs, workers: int = 8) -> np.ndarray:
-    """`[min((a * x + b) % prime) for (a, b) in hash_funcs]` as int64.
+    """`[min((a * x + b) % PRIME) for (a, b) in hash_funcs]` as int64.
 
     Equivalent to `minhash.calculate_signature`. Raises ValueError for an empty
     shingle list, as `min()` does.
+
+    The modulus is always `PRIME`, matching the only value the reference's
+    `__main__` uses; it is not read back off `hash_funcs`, because this API
+    returns bare `(a, b)` pairs rather than the reference's closures that
+    captured their own `c`.
     """
     pairs = np.asarray(hash_funcs, dtype=np.int64)
     return _lib.signature(np.asarray(shingles), pairs, PRIME, workers)
@@ -74,9 +86,11 @@ def calculate_signature(shingles, hash_funcs, workers: int = 8) -> np.ndarray:
 def approx_jaccard_score(a, b, axis: int = 0) -> float:
     """Fraction of signature positions where `a` and `b` agree.
 
-    `axis=0` compares a single signature against another; `axis=1` compares one
-    signature against a block of them, as the reference does when it builds the
-    upper triangle.
+    `axis=0` compares a single signature against another. This one delegates to
+    NumPy rather than to `mh_jaccard_rows`: it is an O(sig_len) comparison, not
+    the O(n^2 * sig_len) scan the kernel is for, and at that size a ctypes round
+    trip costs more than the work. The block form, which is what the reference's
+    `__main__` actually builds, is `score_matrix`.
     """
     aa = np.asarray(a, dtype=np.int64)
     if axis != 0:
@@ -84,6 +98,10 @@ def approx_jaccard_score(a, b, axis: int = 0) -> float:
             "use score_matrix() for the block comparison; it is the compiled path"
         )
     bb = np.asarray(b, dtype=np.int64)
+    if aa.ndim != 1 or bb.ndim != 1 or aa.shape != bb.shape:
+        raise ValueError("a and b must be 1-D signatures of equal length")
+    if aa.size == 0:
+        raise ValueError("a signature must have at least one position")
     return np.count_nonzero(aa == bb, axis) / len(aa)
 
 

@@ -11,7 +11,9 @@ Run: python bench/bench.py
 
 from __future__ import annotations
 
+import os
 import pathlib
+import subprocess
 import sys
 import time
 import zlib
@@ -263,6 +265,34 @@ def bench_histogram_from_rows(n_docs: int = 4000, sig_len: int = 64):
     )
 
 
+def bench_jaccard_rows(n_docs: int = 700, sig_len: int = 64):
+    """The O(n^2 * sig_len) agreement kernel against a vectorised NumPy form.
+
+    This is `mh_jaccard_rows` with the thread fan-out disabled, so it times the
+    kernel body rather than the pool. The baseline is the fully vectorised
+    `(sigs[:, None, :] == sigs[None, :, :]).sum(-1) / sig_len` triangle, which
+    is the fastest fair equivalent: a Python loop would be measuring CPython,
+    not NumPy.
+    """
+    rng = np.random.default_rng(11)
+    sigs = rng.integers(0, 64, size=(n_docs, sig_len), dtype=np.int64)
+
+    def theirs():
+        agree = (sigs[:, None, :] == sigs[None, :, :]).sum(-1)
+        return [
+            (agree[i, i + 1 :] / sig_len) for i in range(n_docs)
+        ]
+
+    got = _lib.jaccard_scores(sigs, workers=1)
+    for a, b in zip(got, theirs()):
+        assert np.array_equal(a, b), "jaccard_rows mismatch"
+    return (
+        f"jaccard_rows {n_docs}x{sig_len}",
+        _time(theirs, 3),
+        _time(lambda: _lib.jaccard_scores(sigs, workers=1)),
+    )
+
+
 CASES = (
     bench_shingles,
     bench_shingles_end_to_end,
@@ -273,16 +303,44 @@ CASES = (
     bench_score_matrix_threads,
     bench_histogram,
     bench_histogram_from_rows,
+    bench_jaccard_rows,
 )
 
 
+def _machine() -> str:
+    """CPU and load, so a number in the README can be traced to a box."""
+    model = ""
+    try:
+        with open("/proc/cpuinfo") as fp:
+            for line in fp:
+                if line.startswith("model name"):
+                    model = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+    load = os.getloadavg()[0]
+    cores = os.cpu_count() or 0
+    return f"{model or 'unknown CPU'}, {cores} cores, load {load:.0f}"
+
+
 def main():
+    print(f"mojo {_mojo_version()}   numpy {np.__version__}")
+    print(f"host: {_machine()}")
     print(f"{'case':<30}{'reference':>12}{'mojo-minhash':>16}{'ratio':>10}")
     print("-" * 68)
     for fn in CASES:
         label, ref_t, got_t = fn()
         ratio = ref_t / got_t if got_t else float("nan")
         print(f"{label:<30}{ref_t * 1e3:>10.2f}ms{got_t * 1e3:>14.2f}ms{ratio:>9.2f}x")
+
+
+def _mojo_version() -> str:
+    try:
+        return subprocess.run(
+            ["mojo", "--version"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
 
 
 if __name__ == "__main__":

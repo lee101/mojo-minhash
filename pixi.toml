@@ -11,10 +11,27 @@ test = "python -m pytest tests -q"
 bench = "flock /tmp/mojo-bench.lock python bench/bench.py"
 
 [activation.env]
-PYTHONPATH = "python"
+# Absolute: a relative PYTHONPATH only resolves when the task is launched from
+# the repo root, which breaks `pixi run --manifest-path ...` from anywhere else.
+PYTHONPATH = "$PIXI_PROJECT_ROOT/python"
+# gensim (an install_requires of upstream minhash) pulls in a threaded BLAS whose
+# worker pool is sized from nproc; on a many-core host that storm can starve a
+# short-lived script. Pin it to one thread so imports and benchmarks are stable.
+OPENBLAS_NUM_THREADS = "1"
+OMP_NUM_THREADS = "1"
+MKL_NUM_THREADS = "1"
 
 [dependencies]
-mojo = "==1.2.0.dev2026092605"
+mojo = "==1.2.0.dev2026092905"
+max = "==26.7.0.dev2026092905"
 python = "3.13.*"
 pytest = "*"
 numpy = "*"
+
+# upstream `minhash` (github.com/mattf/minhash) is PyPI-only, not conda-forge.
+# It is installed so the tests assert real numerical parity against it.
+# `gensim` and `mfoops` come along as its declared install_requires; they are
+# imported only by upstream's `__main__` driver, not by the four library
+# functions this port mirrors.
+[pypi-dependencies]
+minhash = "*"
