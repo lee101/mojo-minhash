@@ -177,46 +177,93 @@ print(hist)                                     # counts per bin
 
 ## Benchmarks
 
-Correctness is checked against the reference before every case is timed. The
-table below is one `pixi run bench` run on this machine; re-run it to get
-fresh numbers.
+Correctness is checked against the reference before every case is timed. Re-run
+`pixi run bench` to get fresh numbers.
 
 * Toolchain: Mojo 1.2.0.dev2026092905, NumPy 2.5.1
 * Host: Intel Xeon E5-2697 v4 @ 2.30GHz, 72 cores
-* This host is shared: load average sat around 70-76 on 72 cores during the
-  runs, so the absolute times are noisy and the thread-scaling rows in
-  particular move by 30-60% between runs. The single-threaded rows were stable
-  to within about 10% over three consecutive runs.
+* This host is shared with other benchmark ports. Every figure below is one
+  `pixi run bench` run and carries the load average it ran under; repeat runs
+  of the single-threaded rows agree within about 10%, the thread-scaling rows
+  move much more between runs.
+* **Results can differ in the last bits.** The reduction kernels reassociate:
+  `_agree` sums eight partial counters and the adler-32 kernel defers its
+  modulo, so a float or integer summary is exact but its accumulation order is
+  not the scalar one's. All parity tests still compare exactly (`atol=rtol=0`)
+  and pass.
+
+### Before and after the unroll phase
+
+`before` is the tree at the start of the unroll phase (bench and raw-kernel
+harness both run at load 14 in that session); `after` is the same two runs at
+the end of it (both at load 13). `bench` rows are the correctness-gated
+`pixi run bench` cases. `kernel` rows are `bench/kernels_micro.py`, which times
+the exported kernels through the same ctypes bridge with the thread fan-out off,
+so a kernel change shows up without the wrapper.
+
+| case | before | after | change |
+| --- | ---: | ---: | ---: |
+| bench: shingles, n=20000 k=5 | 1.58 ms | 1.43 ms | 1.10x |
+| bench: shingles end to end | 2.24 ms | 1.97 ms | 1.14x |
+| bench: signature, h=128 s=4096 | 5.75 ms | 5.98 ms | unchanged |
+| bench: 64 docs x 64 hashes | 26.48 ms | 26.10 ms | unchanged |
+| bench: score matrix 400x64 | 4.76 ms | 4.15 ms | 1.15x |
+| bench: histogram, n=7998000 | 36.67 ms | 20.04 ms | **1.83x** |
+| bench: histogram from rows | 92.20 ms | 76.51 ms | 1.21x |
+| bench: jaccard_rows 700x64 | 14.29 ms | 15.26 ms | unchanged |
+| kernel: signature h=128 s=4096 | 5.91 ms | 5.68 ms | ~4% |
+| kernel: signature h=256 s=4096 | 11.79 ms | 11.39 ms | ~3% |
+| kernel: jaccard 400x64 | 4.79 ms | 4.76 ms | unchanged |
+| kernel: jaccard 700x64 | 14.57 ms | 12.57 ms | 1.16x |
+| kernel: jaccard 900x128 | 43.72 ms | 39.63 ms | 1.10x |
+| kernel: histogram n=7998000 | 47.14 ms | 27.13 ms | **1.74x** |
+| kernel: histogram n=126000 | 0.71 ms | 0.42 ms | 1.71x |
+| kernel: shingles n=20000 | 1.63 ms | 1.33 ms | 1.23x |
+| kernel: shingles n=200 | 0.027 ms | 0.030 ms | unchanged |
+
+"unchanged" means the before/after difference is inside this machine's run-to-run
+noise for that case; no number was chosen from a favourable repeat.
+
+### Current `pixi run bench` (after, load 13)
 
 | case | reference | mojo-minhash | ratio |
 | --- | ---: | ---: | ---: |
-| shingles, n=20000 k=5, pre-laid-out spans | 3.08 ms | 1.55 ms | **1.99x** |
-| shingles end to end from a token list | 3.00 ms | 2.09 ms | **1.44x** |
-| signature, h=128 s=4096, vs vectorised NumPy uint64 | 8.15 ms | 5.84 ms | 1.40x |
-| signature, h=256 s=4096, 8 threads vs 1 | 11.77 ms | 3.21 ms | 3.67x |
-| 64 docs x 64 hashes, vs `minhash.calculate_signature` | 686.74 ms | 26.27 ms | **26.15x** |
-| score matrix 400x64, vs `approx_jaccard_score` | 16.13 ms | 4.64 ms | **3.48x** |
-| `mh_jaccard_rows` 700x64, vs vectorised NumPy triangle | 68.05 ms | 15.00 ms | **4.54x** |
-| score matrix 900x128, 8 threads vs 1 | 43.07 ms | 19.56 ms | 2.20x |
-| histogram, n=7998000, vs `np.histogram` | 31.26 ms | 35.69 ms | **0.88x (loss)** |
-| histogram from the row list `score_matrix` returns | 140.49 ms | 69.99 ms | 2.01x |
+| shingles, n=20000 k=5, pre-laid-out spans | 3.42 ms | 1.43 ms | **2.39x** |
+| shingles end to end from a token list | 3.30 ms | 1.97 ms | **1.68x** |
+| signature, h=128 s=4096, vs vectorised NumPy uint64 | 9.04 ms | 5.98 ms | 1.51x |
+| signature, h=256 s=4096, 8 threads vs 1 | 13.98 ms | 2.76 ms | 5.06x |
+| 64 docs x 64 hashes, vs `minhash.calculate_signature` | 658.50 ms | 26.10 ms | **25.23x** |
+| score matrix 400x64, vs `approx_jaccard_score` | 16.32 ms | 4.15 ms | **3.94x** |
+| `mh_jaccard_rows` 700x64, vs vectorised NumPy triangle | 69.40 ms | 15.26 ms | **4.55x** |
+| score matrix 900x128, 8 threads vs 1 | 47.96 ms | 23.67 ms | 2.03x |
+| histogram, n=7998000, vs `np.histogram` | 32.66 ms | 20.04 ms | **1.63x** |
+| histogram from the row list `score_matrix` returns | 143.73 ms | 76.51 ms | 1.88x |
 
 Reading the numbers honestly:
 
-* **The one loss is the flat-array histogram, 0.88x.** `np.histogram` over 8M
-  values is already a tight two-pass NumPy primitive, while this kernel is a
-  single pass with a scattered increment into 11 bins. Calling `score_histogram`
-  with the ragged row list instead — the way a user actually reaches it, since
-  that is what `score_matrix` returns — is 2.01x, because the reference then
-  pays a NumPy concatenate too.
-* **The headline 26x is against CPython, not against NumPy.** The reference's
+* **The flat-array histogram used to be the one loss and is now a 1.63x win.**
+  `np.histogram` over 8M values is a tight two-pass NumPy primitive; this kernel
+  was a single pass whose per-score branch chain was the cost. Most of the gain
+  came from computing the bucket in one branch-free path and checking range once
+  (five comparisons became one, on the common value), the rest from deferring
+  the adler-32 modulo in the shingle kernel and from `_agree`'s block. A pooled
+  multi-counter variant was tried for the increment itself and reverted: it
+  measured **slower** (27.1 → 42.4 ms), because a second indexed update per score
+  costs more than the single cache line it was meant to relieve.
+* **The headline 25x is against CPython, not against NumPy.** The reference's
   `calculate_signature` applies a Python lambda once per shingle per hash, so
   that row measures the interpreter, not the arithmetic. The honest comparison
-  for the kernel itself is the `signature, h=128 s=4096` row at 1.40x against
+  for the kernel itself is the `signature, h=128 s=4096` row at 1.51x against
   the fastest vectorised uint64 NumPy formulation the same arithmetic allows.
-* **Threading scales worse than the core count.** 3.67x on 8 workers for a
-  kernel that is genuinely compute-bound on a 64-bit `div`, with load average
-  near the core count. Treat the thread-scaling rows as a lower bound.
+* **The signature kernel did not unroll better.** A `comptime for` over the hash
+  columns measured slower than the four hand-written chains with an identical
+  emitted body, so it was reverted; the column chains and hoisted coefficients
+  were already what it needed. This toolchain leaves a `for i in range(4)` as a
+  runtime loop, so a fixed trip count alone buys no unrolling.
+* **Threading scales worse than the core count.** 5.06x on 8 workers for a
+  kernel that is genuinely compute-bound on a 64-bit `div`, on a machine shared
+  with other benchmark ports. Treat the thread-scaling rows as a lower bound.
+
 
 ## How it works
 
@@ -229,18 +276,36 @@ an inferred pointer origin would make the symbol parametric.
    pre-joined buffer, re-inserting the single space that `" ".join` puts
    between tokens, and runs adler-32 over the resulting bytes. The number of
    windows is `max(1, n_tokens - k + 1)`, matching the reference's `maxlen`
-   deque.
+   deque. The modulo is deferred: a token of up to 4096 bytes runs under one
+   running modulus, which is taken at the end of the token or earlier if the
+   sums approach `2**50`; a longer token reduces every byte. A reduction at any
+   point gives the same residue, so both paths are exact.
 2. **`mh_signature`** computes `out[h] = min_s (a[h] * x[s] + b[h]) % prime`. It
    runs `HASH_BLOCKS = 4` hash columns per shingle so the 64-bit divide has
-   independent chains to interleave with, then finishes any remainder with a
-   scalar loop. The reduction mod `c` is done on 16-bit limbs to keep every
-   intermediate below `2**51`.
+   independent chains to interleave with, with the coefficients hoisted out of
+   the shingle loop, then finishes any remainder with a scalar loop. The
+   reduction mod `c` is done on 16-bit limbs to keep every intermediate below
+   `2**51`.
 3. **`mh_jaccard_rows`** fills the upper-triangular agreement matrix. Row `i`
    lives at a fixed stride of `n_docs` so rows stay at constant offsets under
    chunking, and the count is an exact integer comparison — only the final
-   division is floating point.
-4. **`mh_score_hist`** zeroes its output, then counts each score into
-   `clamp(trunc(score * scale))`, skipping the scores `np.histogram` drops.
+   division is floating point. Each pairwise count (`_agree`) walks
+   `AGREE_ACCS = 8` positions at a time into eight independent counters with a
+   `comptime` trip count, which this toolchain unrolls and vectorises; the
+   counters are summed at the end. The count is a sum of 0/1 terms, so the
+   reassociation changes no value.
+4. **`mh_score_hist`** counts each score into `clamp(trunc(score * scale))`,
+   skipping the scores `np.histogram` drops. The common value (a finite score in
+   range) takes one branch: multiply, floor, cast, one range comparison. Only
+   the negative side (the floor-versus-truncation fix-up) and the overflow side
+   (clamp versus drop an infinite) are one level down. Non-finite scores are
+   rejected before the cast, because `Int64(Float64)` of NaN/+inf is
+   unspecified on this toolchain.
+
+Two techniques were tried and reverted because `pixi run bench` showed no gain:
+a `comptime for` over the signature columns (identical emitted code, plus the
+constant-array loads) and pooled count tables in the histogram (27.1 → 42.4 ms
+on the raw kernel).
 
 `python/mojo_minhash/_lib.py` is the ctypes bridge. It owns no memory: the
 library borrows the caller's buffers for the duration of a call and writes only
@@ -262,8 +327,10 @@ build/build.sh              src/kernels.mojo -> dist/libmojo-minhash.so
 src/kernels.mojo            one compilation unit, four @export kernels
 python/mojo_minhash/_lib.py ctypes bridge; arity-checked argtypes, input validation
 python/mojo_minhash/minhash.py  the ported public API
-tests/                      168 tests, including parity against the real minhash
+tests/                      342 tests, including parity against the real minhash
 bench/bench.py              correctness-gated timing
+bench/kernels_micro.py      raw-kernel timing, thread fan-out off
+bench/analysis.md           ANALYZE phase: where the time goes
 ```
 
 `MOJO_NOTES.md` records the Mojo dialect behaviour this port depends on

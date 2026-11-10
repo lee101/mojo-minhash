@@ -20,9 +20,10 @@ mojo 1.2.0.dev2026092905:
   Likewise the unsigned comparison `r >= cs` is not a signed test.
 
 `Int64(Float64)` on this toolchain is round-half-to-even, so the histogram's
-truncation is written out; see `_bucket`.
+truncation is written out; see `mh_score_hist`.
 """
 
+from std.collections import List
 from std.math import floor
 
 comptime U8Ptr = Pointer[UInt8, AnyOrigin[mut=True]]
@@ -35,9 +36,28 @@ comptime F64Ptr = Pointer[Float64, AnyOrigin[mut=True]]
 comptime ADLER_MOD = UInt64(65521)
 comptime PREC16 = UInt64(0xFFFF)
 
+# A token of at most this many bytes runs the shingles' adler-32 loop under one
+# deferred reduction; a longer one reduces every byte. Both are exact for the
+# same reason: `a` and `b` are only ever meaningful modulo ADLER_MOD, and a
+# reduction taken early yields the same residue as one taken after every byte.
+comptime MAX_FAST_TOKEN = 4096
+
+# With MAX_FAST_TOKEN = 4096 and a bound R on both running sums at the start of
+# a token, the next token adds at most 4096*R + 255*4096*4097/2 < 4097*R + 2**31
+# to `b` (and 255*4096 + 33 to `a`, which is far below R). R = 2**50 therefore
+# keeps every intermediate below 2**63 -- 4097*2**50 + 2**31 < 2**63 -- with
+# room to spare, so the sums never wrap and the final residue is CPython's.
+comptime FAST_REDUCE_ABOVE = UInt64(0x4000000000000)  # 2**50
+
 # Hash columns the signature kernel keeps in flight. Each column owns its own
 # minimum, so several independent divide chains hide each other's latency.
 comptime HASH_BLOCKS = 4
+
+# Partial agreement counters `_agree` keeps in flight, and the block of
+# positions each of them walks per iteration. A position costs one load from
+# each signature plus a compare-and-add, so eight independent counters keep the
+# compare/add pipeline full instead of waiting on a single dependency chain.
+comptime AGREE_ACCS = 8
 
 
 def u8p(addr: Int) -> U8Ptr:
@@ -90,7 +110,14 @@ def _signature_one(x: U32Ptr, a: UInt64, b: UInt64, c: UInt64, p16: UInt64,
 
 def _signature_block(x: U32Ptr, co: I64Ptr, res: U64Ptr, h0: Int, h1: Int,
                      n: Int, c: UInt64, p16: UInt64, p32: UInt64, p48: UInt64):
-    """Hashes [h0, h1) of `mh_signature`, HASH_BLOCKS columns at a time."""
+    """Hashes [h0, h1) of `mh_signature`, HASH_BLOCKS columns at a time.
+
+    The coefficients and the running minimum of each column are hoisted out of
+    the shingle loop, and each shingle is loaded once and reused by all
+    HASH_BLOCKS chains. (A `comptime`-unrolled column loop was tried here and
+    measured slower at h=128 and h=256: the emitted body was identical, so it
+    only cost the constant array loads.)
+    """
     var h = h0
     while h + HASH_BLOCKS <= h1:
         var a0 = UInt64(co[unsafe_offset=2 * h])
@@ -127,52 +154,43 @@ def _signature_block(x: U32Ptr, co: I64Ptr, res: U64Ptr, h0: Int, h1: Int,
 
 
 def _agree(sig: I64Ptr, base_i: Int, base_j: Int, sig_len: Int) -> Int64:
-    """How many positions two signatures agree on."""
-    var hits = Int64(0)
-    for k in range(sig_len):
-        if sig[unsafe_offset=base_i + k] == sig[unsafe_offset=base_j + k]:
-            hits += Int64(1)
-    return hits
+    """How many positions two signatures agree on.
 
+    `sig_len` positions are walked `AGREE_ACCS` at a time, one partial counter
+    per accumulator, and the counters are combined once at the end. The block's
+    trip count is a `comptime` constant, which this toolchain unrolls (a
+    literal range is left as a loop), and that is also what lets it vectorise
+    the compare-and-count. Positions past the last full block are counted into
+    one of the same counters; a signature shorter than a block uses the scalar
+    loop.
 
-def _bucket(v: Float64, scale: Float64, top: Int64) -> Int64:
-    """`clamp(trunc(v * scale), 0, top)`, or -1 if `np.histogram` drops `v`.
-
-    The reference bins `(row * 10).astype(int) / 10` against
-    `(0, .1, ..., 1, 42)`, so the value that is placed in a bin is the *truncated*
-    one, not `v`. Three consequences are easy to get wrong:
-
-    * The floor plus the negative-side correction is exactly truncation toward
-      zero. `Int64(Float64)` on this toolchain is round-half-to-even, which
-      would put a score of exactly 0.15 in bin 2 instead of bin 1.
-    * The "below the first edge means drop" test applies to the truncated
-      bucket, not to `v * scale`. A score of -0.05 truncates to bucket 0 and the
-      reference counts it in bin 0; only a score that truncates below 0 is
-      dropped.
-    * Non-finite scores are dropped too. NumPy casts NaN and +/-inf to INT_MIN,
-      which is to the left of the first bin edge, so `np.histogram` ignores
-      them. Folding them into bin 0 would hide the upstream failure that
-      produced them -- an empty signature scores 0/0, i.e. NaN.
-
-    A finite score that truncates past the top bin is clamped into it rather
-    than dropped, matching the documented "last bin absorbs the overflow"
-    behaviour. `np.histogram` would drop a value above its final edge, but that
-    needs the edge itself, which this kernel deliberately does not take: a score
-    is `count / sig_len` and so cannot exceed 1.
+    Every position is a 0/1 add, so the reassociation changes no value: the
+    count is exact for any summation order.
     """
-    var p = v * scale
-    if p != p:
-        return Int64(-1)  # NaN
-    if p > 1.0e300 or p < -1.0e300:
-        return Int64(-1)  # +/-inf: the reference casts these to INT_MIN
-    var k = Int64(floor(p))
-    if v < 0.0 and Float64(k) != p:
-        k += 1
-    if k < 0:
-        return Int64(-1)
-    if k > top:
-        k = top
-    return k
+    var hits = Int64(0)
+    if sig_len >= AGREE_ACCS:
+        var accs = List[Int64](capacity=AGREE_ACCS)
+        comptime for c in range(AGREE_ACCS):
+            accs.append(Int64(0))
+        var k = 0
+        while k + AGREE_ACCS <= sig_len:
+            comptime for c in range(AGREE_ACCS):
+                accs[c] += Int64(
+                    sig[unsafe_offset=base_i + k + c]
+                    == sig[unsafe_offset=base_j + k + c]
+                )
+            k += AGREE_ACCS
+        while k < sig_len:
+            accs[0] += Int64(
+                sig[unsafe_offset=base_i + k] == sig[unsafe_offset=base_j + k]
+            )
+            k += 1
+        comptime for c in range(AGREE_ACCS):
+            hits += accs[c]
+        return hits
+    for k in range(sig_len):
+        hits += Int64(sig[unsafe_offset=base_i + k] == sig[unsafe_offset=base_j + k])
+    return hits
 
 
 @export("mh_shingle_adler32")
@@ -188,6 +206,13 @@ def mh_shingle_adler32(buf_addr: Int, off_addr: Int, len_addr: Int,
     The number of windows is `max(1, n_tokens - k + 1)`: a document shorter
     than `k` tokens still yields one window holding every token, and an empty
     document yields the hash of the empty string, adler32(b"") == 1.
+
+    Like the rest of the port this hashes the bytes of the joined buffer, so
+    the result is the reference's when the joining space is the string's only
+    delimiter. A token whose own bytes contain 0x20 -- a multi-byte UTF-8
+    sequence such as "café" when the whole window is taken as one encode() --
+    is hashed as the separator the caller never wrote; that predates this
+    kernel and is not changed here.
     """
     var buf = u8p(buf_addr)
     var off = i32p(off_addr)
@@ -206,15 +231,35 @@ def mh_shingle_adler32(buf_addr: Int, off_addr: Int, len_addr: Int,
         var b = UInt64(0)
         for j in range(width):
             var lo = Int(off[unsafe_offset=i + j])
-            var hi = lo + Int(tlen[unsafe_offset=i + j])
-            for t in range(hi - lo):
-                a += UInt64(buf[unsafe_offset=lo + t])
-                b += a
-            if j + 1 < width:
-                a += UInt64(32)  # the " " that " ".join inserts
-                b += a
-            a = a % ADLER_MOD
-            b = b % ADLER_MOD
+            var m = Int(tlen[unsafe_offset=i + j])
+            if m <= MAX_FAST_TOKEN:
+                # Short token: one deferred reduction per token pays for itself
+                # after a few bytes. The reduction is skipped only while `a`
+                # and `b` stay under FAST_REDUCE_ABOVE, which bounds the next
+                # token's growth (`b` gains at most m*a + 255*m*(m+1)/2) below
+                # 2**63.
+                for t in range(m):
+                    a += UInt64(buf[unsafe_offset=lo + t])
+                    b += a
+                if j + 1 < width:
+                    a += UInt64(32)  # the " " that " ".join inserts
+                    b += a
+                if j + 1 == width or a > FAST_REDUCE_ABOVE or b > FAST_REDUCE_ABOVE:
+                    a = a % ADLER_MOD
+                    b = b % ADLER_MOD
+            else:
+                # A token longer than MAX_FAST_TOKEN reduces per byte, so the
+                # window's running sum cannot pass 2**63 before the next check.
+                for t in range(m):
+                    a += UInt64(buf[unsafe_offset=lo + t])
+                    b += a
+                    a = a % ADLER_MOD
+                    b = b % ADLER_MOD
+                if j + 1 < width:
+                    a += UInt64(32)  # the " " that " ".join inserts
+                    b += a
+                    a = a % ADLER_MOD
+                    b = b % ADLER_MOD
         res[unsafe_offset=i] = UInt32((b << 16) | a)
 
 
@@ -270,14 +315,37 @@ def mh_score_hist(scores_addr: Int, n: Int, scale: Float64, n_bins: Int,
                   out_addr: Int) abi("C"):
     """Histogram the truncated scores: bucket = clamp(trunc(score * scale)).
 
-    This reproduces `(row * 10).astype(int) / 10` fed to
-    `np.histogram(row, (0, .1, ..., 1, 42))`: truncating to one decimal makes
-    every value exactly k/scale, so the bin is `k` with the top bin absorbing
-    the score of exactly 1.0 (np.histogram's last bin is closed on the right).
+    The reference bins `(row * 10).astype(int) / 10` against
+    `(0, .1, ..., 1, 42)`, so the value that is placed in a bin is the *truncated*
+    one, not `score`, and a score of exactly 1.0 lands in the last bin
+    (`np.histogram`'s last bin is closed on the right). Three consequences are
+    easy to get wrong:
 
-    Scores that `np.histogram` would drop -- non-finite scores, and scores that
-    truncate below the first bin edge -- are skipped rather than folded into
-    bin 0; see `_bucket`.
+    * The floor plus the negative-side correction is exactly truncation toward
+      zero. `Int64(Float64)` on this toolchain is round-half-to-even, which
+      would put a score of exactly 0.15 in bin 2 instead of bin 1.
+    * The "below the first edge means drop" test applies to the truncated
+      bucket, not to `score * scale`. A score of -0.05 truncates to bucket 0 and
+      the reference counts it in bin 0; only a score that truncates below 0 is
+      dropped.
+    * Non-finite scores are dropped too. NumPy casts NaN and +/-inf to INT_MIN,
+      which is to the left of the first bin edge, so `np.histogram` ignores
+      them. Folding them into bin 0 would hide the upstream failure that
+      produced them -- an empty signature scores 0/0, i.e. NaN. Here they are
+      caught by a finiteness test before the cast, because a non-finite
+      `Int64(Float64)` is unspecified on this toolchain: measured, it yields a
+      large positive value rather than INT_MIN, so it cannot be recognised
+      after the cast.
+
+    A finite score that truncates past the top bin is clamped into it rather
+    than dropped, matching the documented "last bin absorbs the overflow"
+    behaviour. `np.histogram` would drop a value above its final edge, but that
+    needs the edge itself, which this kernel deliberately does not take: a score
+    is `count / sig_len` and so cannot exceed 1.
+
+    The common value -- a finite score in range -- costs one multiply, one
+    floor, one cast and one comparison. The negative and the overflow sides are
+    one level down and are reached only by scores that are already out of range.
     """
     var sc = f64p(scores_addr)
     var out = i64p(out_addr)
@@ -286,6 +354,23 @@ def mh_score_hist(scores_addr: Int, n: Int, scale: Float64, n_bins: Int,
     for b in range(n_bins):
         out[unsafe_offset=b] = Int64(0)
     for t in range(n):
-        var b = _bucket(sc[unsafe_offset=t], scale, top)
-        if b >= 0:
+        var p = sc[unsafe_offset=t] * scale
+        if p > 1.0e300 or p < -1.0e300:
+            continue  # NaN and +/-inf: `np.histogram` casts these out of range
+        var b = Int64(floor(p))
+        if b == top:
+            # exactly `top` is in range (the last bin is closed on the right);
+            # this arm keeps the common in-range value at one comparison.
             out[unsafe_offset=b] += Int64(1)
+        elif b > top:
+            out[unsafe_offset=top] += Int64(1)  # clamp into the top bin
+        elif b >= 0:
+            out[unsafe_offset=b] += Int64(1)
+        elif p < 0.0:
+            # A negative floor: truncation toward zero is `floor` itself when
+            # the value sits exactly on it, and one above it otherwise. Only a
+            # score this far out (-1 <= p < 0) ever needs the fix-up.
+            if Float64(b) != p:
+                b += Int64(1)
+            if b >= 0:
+                out[unsafe_offset=b] += Int64(1)

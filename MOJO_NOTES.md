@@ -51,6 +51,29 @@ toolchain bump rather than trusting this file.
 - `AnyOrigin[mut=True]` is the only usable mutable origin name. `MutableAnyOrigin`
   and friends do not exist.
 
+## 2b. Unrolling — verified on 1.2.0.dev2026092905
+
+`@parameter for` does **not** exist here: `'for' statement does not support
+decorators`. `unroll(...)` is an unknown declaration. What does work:
+
+- A loop whose **trip count is a `comptime` constant is unrolled**; a literal
+  trip count is not. `comptime W = 4` + `for i in range(W)` emits straight-line
+  code, while `for i in range(4)` emits a runtime loop (with `cmpq $4` and a
+  backward jump). The single-argument range is the case that unrolls; a stepped
+  range such as `for i in range(0, 8, 4)` was measured to stay a loop even under
+  a `comptime` trip count, so write the step out as separate statements.
+- `comptime for x in ...:` over a `comptime` range emits straight-line code
+  with the index as a compile-time constant (`#0`, `#1`, ... in the body).
+- A loop with a `comptime` single-argument range whose body has no
+  data-dependent branch is unrolled and auto-vectorised; that is how `_agree` in
+  `mojo-minhash` gets a `vpcmpeqq` block out of eight independent counters. A
+  body with a branch (the histogram's bucket test) stays scalar.
+- `InlineArray` does not exist. Use a small `List[T](capacity=N)` filled with
+  `comptime for`, or separate named locals.
+- `Int64(Float64)` of `NaN`/`+/-inf` is **not** INT_MIN here: measured, it is a
+  large positive value (~1.4e14), so a non-finite cast cannot be recognised
+  after the fact. Test finiteness on the float first.
+
 ## 3. Memory and SIMD (all verified working)
 
 ```mojo
