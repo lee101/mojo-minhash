@@ -201,47 +201,86 @@ the end of it (both at load 13). `bench` rows are the correctness-gated
 the exported kernels through the same ctypes bridge with the thread fan-out off,
 so a kernel change shows up without the wrapper.
 
+Verified 2026-11-10 by rebuilding `98dc249` (before) in a scratch worktree and
+running the same two harnesses against it and against HEAD (after). Both columns
+below are from that session, so where a figure moved it is the measured value,
+not the old one. 16 of the 17 `before` values reproduce within 20% (the miss is
+`bench: histogram from rows`, 69.13 vs 92.20 ms, i.e. the host was quieter this
+session), and so do the `after` values except the four thread-scaling rows.
+That last group is the parallel phase: "before" (`98dc249`) still has
+the fan-out those rows measure and "after" (HEAD) has it capped off, so the
+`after` side is what the parallel phase changed: it turned a 5.4x / 1.9x win
+into 1.0x, and it is kept in the table as measured. The other `after` row that
+moved is `bench: shingles` (1.10x before, 0.95x now -- on a shared host whose
+kernel row for the same work moved 1.59 -> 1.42 ms), kept as measured too.
+
 | case | before | after | change |
 | --- | ---: | ---: | ---: |
-| bench: shingles, n=20000 k=5 | 1.58 ms | 1.43 ms | 1.10x |
-| bench: shingles end to end | 2.24 ms | 1.97 ms | 1.14x |
-| bench: signature, h=128 s=4096 | 5.75 ms | 5.98 ms | unchanged |
-| bench: 64 docs x 64 hashes | 26.48 ms | 26.10 ms | unchanged |
-| bench: score matrix 400x64 | 4.76 ms | 4.15 ms | 1.15x |
-| bench: histogram, n=7998000 | 36.67 ms | 20.04 ms | **1.83x** |
-| bench: histogram from rows | 92.20 ms | 76.51 ms | 1.21x |
-| bench: jaccard_rows 700x64 | 14.29 ms | 15.26 ms | unchanged |
-| kernel: signature h=128 s=4096 | 5.91 ms | 5.68 ms | ~4% |
-| kernel: signature h=256 s=4096 | 11.79 ms | 11.39 ms | ~3% |
-| kernel: jaccard 400x64 | 4.79 ms | 4.76 ms | unchanged |
-| kernel: jaccard 700x64 | 14.57 ms | 12.57 ms | 1.16x |
-| kernel: jaccard 900x128 | 43.72 ms | 39.63 ms | 1.10x |
-| kernel: histogram n=7998000 | 47.14 ms | 27.13 ms | **1.74x** |
-| kernel: histogram n=126000 | 0.71 ms | 0.42 ms | 1.71x |
-| kernel: shingles n=20000 | 1.63 ms | 1.33 ms | 1.23x |
-| kernel: shingles n=200 | 0.027 ms | 0.030 ms | unchanged |
+| bench: shingles, n=20000 k=5 | 1.57 ms | 1.65 ms | 0.95x |
+| bench: shingles end to end | 2.20 ms | 1.85 ms | 1.19x |
+| bench: signature, h=128 s=4096 | 5.74 ms | 6.32 ms | unchanged |
+| bench: 64 docs x 64 hashes | 26.03 ms | 30.88 ms | unchanged |
+| bench: score matrix 400x64 | 5.56 ms | 5.37 ms | unchanged |
+| bench: histogram, n=7998000 | 37.31 ms | 20.07 ms | **1.86x** |
+| bench: histogram from rows | 69.13 ms | 74.14 ms | unchanged |
+| bench: jaccard_rows 700x64 | 14.27 ms | 12.02 ms | 1.19x |
+| kernel: signature h=128 s=4096 | 5.72 ms | 5.97 ms | unchanged |
+| kernel: signature h=256 s=4096 | 11.69 ms | 12.15 ms | unchanged |
+| kernel: jaccard 400x64 | 4.68 ms | 3.91 ms | 1.20x |
+| kernel: jaccard 700x64 | 14.10 ms | 13.72 ms | unchanged |
+| kernel: jaccard 900x128 | 44.43 ms | 36.90 ms | 1.20x |
+| kernel: histogram n=7998000 | 46.50 ms | 28.44 ms | **1.64x** |
+| kernel: histogram n=126000 | 0.70 ms | 0.45 ms | 1.56x |
+| kernel: shingles n=20000 | 1.59 ms | 1.42 ms | 1.12x |
+| kernel: shingles n=200 | 0.032 ms | 0.028 ms | unchanged |
 
 "unchanged" means the before/after difference is inside this machine's run-to-run
 noise for that case; no number was chosen from a favourable repeat.
 
-### Current `pixi run bench` (after, load 13)
+### Current `pixi run bench` (HEAD, verified 2026-11-10, load 32)
+
+Remeasured in the VERIFY phase on the tree as committed. Each figure is one
+`pixi run bench` run at load 32; four runs that session put every
+single-threaded row within 20% of these figures. The two thread rows are a
+different story -- see the note after the table.
 
 | case | reference | mojo-minhash | ratio |
 | --- | ---: | ---: | ---: |
-| shingles, n=20000 k=5, pre-laid-out spans | 3.42 ms | 1.43 ms | **2.39x** |
-| shingles end to end from a token list | 3.30 ms | 1.97 ms | **1.68x** |
-| signature, h=128 s=4096, vs vectorised NumPy uint64 | 9.04 ms | 5.98 ms | 1.51x |
-| signature, h=256 s=4096, 8 threads vs 1 | 13.98 ms | 2.76 ms | 5.06x |
-| 64 docs x 64 hashes, vs `minhash.calculate_signature` | 658.50 ms | 26.10 ms | **25.23x** |
-| score matrix 400x64, vs `approx_jaccard_score` | 16.32 ms | 4.15 ms | **3.94x** |
-| `mh_jaccard_rows` 700x64, vs vectorised NumPy triangle | 69.40 ms | 15.26 ms | **4.55x** |
-| score matrix 900x128, 8 threads vs 1 | 47.96 ms | 23.67 ms | 2.03x |
-| histogram, n=7998000, vs `np.histogram` | 32.66 ms | 20.04 ms | **1.63x** |
-| histogram from the row list `score_matrix` returns | 143.73 ms | 76.51 ms | 1.88x |
+| shingles, n=20000 k=5, pre-laid-out spans | 3.79 ms | 1.65 ms | **2.30x** |
+| shingles end to end from a token list | 3.32 ms | 1.85 ms | **1.79x** |
+| signature, h=128 s=4096, vs vectorised NumPy uint64 | 8.58 ms | 6.32 ms | 1.36x |
+| signature, h=256 s=4096, 8 workers requested vs 1 | 12.68 ms | 12.52 ms | 1.01x |
+| 64 docs x 64 hashes, vs `minhash.calculate_signature` | 659.22 ms | 30.88 ms | **21.34x** |
+| score matrix 400x64, vs `approx_jaccard_score` | 18.03 ms | 5.37 ms | **3.36x** |
+| `mh_jaccard_rows` 700x64, vs vectorised NumPy triangle | 73.06 ms | 12.02 ms | **6.08x** |
+| score matrix 900x128, 8 workers requested vs 1 | 36.47 ms | 37.22 ms | 0.98x |
+| histogram, n=7998000, vs `np.histogram` | 31.33 ms | 20.07 ms | **1.56x** |
+| histogram from the row list `score_matrix` returns | 144.37 ms | 74.14 ms | 1.95x |
+
+**The thread-scaling rows no longer scale, and the two rows above that used to
+show 5.06x and 2.03x now measure 1.01x and 0.98x.** This is not input noise:
+the parallel phase set `WORKER_CAP = 4`, gated `mh_signature` at
+`SIG_PARALLEL_MIN = 1<<23` hash\*shingle units, and gated `mh_jaccard_rows`
+off entirely (`JAC_PARALLEL_MIN = 1<<62`). The two bench cases are shaped
+`256x4096` (= 2^20 units) and `900x128` (jaccard, permanently serial), so
+both now take the serial path, and asking for 8 workers is exactly as fast as
+asking for 1. Row `64 docs x 64 hashes` and `jaccard_rows 700x64` changed by
+15% and 34% against the previous README table; both are inside the
+run-to-run spread of this shared host over four runs, not a code change.
+
+The earlier 8-thread figures *were* real on the tree they were taken from. On
+the pre-parallel tree (`98dc249`, built in a scratch worktree this session,
+load 22) the same two inputs measure 11.6-11.9 ms -> 2.1 ms (1 worker -> 8
+workers) for `signature 256x4096`, and 44-46 ms -> 21-25 ms for
+`score_matrix 900x128`. The parallel phase replaced the Python
+`ThreadPoolExecutor` with `max.algorithm.parallelize` inside the kernel and
+capped it at four workers; on HEAD the same inputs measure 12.6-13.8 ms -> 12.0-13.8 ms
+and 44-45 ms -> 44-45 ms. So the port really did lose its threaded speedup;
+the rows stay in the table with the loss shown rather than being removed.
 
 Reading the numbers honestly:
 
-* **The flat-array histogram used to be the one loss and is now a 1.63x win.**
+* **The flat-array histogram used to be the one loss and is now a 1.56x win.**
   `np.histogram` over 8M values is a tight two-pass NumPy primitive; this kernel
   was a single pass whose per-score branch chain was the cost. Most of the gain
   came from computing the bucket in one branch-free path and checking range once
@@ -253,16 +292,21 @@ Reading the numbers honestly:
 * **The headline 25x is against CPython, not against NumPy.** The reference's
   `calculate_signature` applies a Python lambda once per shingle per hash, so
   that row measures the interpreter, not the arithmetic. The honest comparison
-  for the kernel itself is the `signature, h=128 s=4096` row at 1.51x against
+  for the kernel itself is the `signature, h=128 s=4096` row at 1.36x against
   the fastest vectorised uint64 NumPy formulation the same arithmetic allows.
 * **The signature kernel did not unroll better.** A `comptime for` over the hash
   columns measured slower than the four hand-written chains with an identical
   emitted body, so it was reverted; the column chains and hoisted coefficients
   were already what it needed. This toolchain leaves a `for i in range(4)` as a
   runtime loop, so a fixed trip count alone buys no unrolling.
-* **Threading scales worse than the core count.** 5.06x on 8 workers for a
-  kernel that is genuinely compute-bound on a 64-bit `div`, on a machine shared
-  with other benchmark ports. Treat the thread-scaling rows as a lower bound.
+* **Threading does not scale on this tree at all.** The shipped
+  `WORKER_CAP = 4` plus the `SIG_PARALLEL_MIN = 1<<23` gate means the benchmark
+  shapes run serially, so the 8-worker rows are 1.01x and 0.98x (see the note
+  above). The gate was justified by kernel-only probes that put the crossover
+  at `512x4096`; the threaded win the pre-parallel tree showed at `256x4096`
+  (5.4x measured this session) is gone from the public API at the shape
+  the benchmark uses. Do not read the thread rows as a lower bound any more:
+  they are a measurement of the serial path.
 
 
 ### GPU phase: CPU only: memory-bound
@@ -276,7 +320,7 @@ and every kernel is below it:
 | `mh_signature` | h=128, s=4096 | 9.9 nominal, ~250 compulsory | 86 MB/s of a 17 GB/s ceiling — L1-resident, serial 64-bit `mod`. The working set is 19 KiB, so there is no traffic to move to a device, and the 64-bit integer modulo is emulated on the GPU. Not a candidate despite the ratio: it is compute-bound on an op the GPU does badly, not bandwidth-bound. |
 | `mh_score_hist` | n=7 998 000 | 0.62 | dependent scatter, latency-bound at 1.67 GB/s |
 | `mh_jaccard_rows` | 400×64 / 700×64 | 0.13 | at the 17.7–17.9 GB/s host ceiling — pure streaming |
-| `mh_shingle_adler32` | 20000 tok, k=5 | 1.0 | per-token `mod 65521` at 890 MB/s |
+| `mh_shingle_adler32` | 20000 tok, k=5 | 1.0 | per-token `mod 65521` at 850 MB/s (1.42 ms this session) |
 
 The shared GPU itself would have passed: `nvidia-smi --query-gpu=memory.free`
 reported **5101 MiB** free (threshold 4000 MiB) on 2026-11-10. The phase was
@@ -339,10 +383,12 @@ buffer is passed, because `c_int` would truncate the address and segfault above
 since a mismatched `argtypes` is silent (ctypes zero-fills missing slots) and an
 out-of-range length is an out-of-bounds read rather than an error.
 
-Parallelism is a `ThreadPoolExecutor` over row or column chunks, not a Mojo
-`parallelize`: the kernels are called through ctypes, where the worker-launch
-path is the fragile one, and the GIL is released for the duration of each
-ctypes call.
+Parallelism lives inside the kernel, via `max.algorithm.parallelize` over column
+or row chunks (see `src/kernels.mojo`), not in a Python pool. It is gated: the
+worker request is capped at `WORKER_CAP = 4`, `mh_signature` only fans out at or
+above `SIG_PARALLEL_MIN = 1<<23` hash\*shingle units, and `mh_jaccard_rows` is
+effectively serial (`JAC_PARALLEL_MIN = 1<<62`). The benchmark rows that show no
+scaling are measuring exactly that gate.
 
 ## Layout
 
@@ -351,7 +397,7 @@ build/build.sh              src/kernels.mojo -> dist/libmojo-minhash.so
 src/kernels.mojo            one compilation unit, four @export kernels
 python/mojo_minhash/_lib.py ctypes bridge; arity-checked argtypes, input validation
 python/mojo_minhash/minhash.py  the ported public API
-tests/                      342 tests, including parity against the real minhash
+tests/                      382 tests, including parity against the real minhash
 bench/bench.py              correctness-gated timing
 bench/kernels_micro.py      raw-kernel timing, thread fan-out off
 bench/analysis.md           ANALYZE phase: where the time goes
