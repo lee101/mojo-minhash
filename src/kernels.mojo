@@ -25,6 +25,9 @@ truncation is written out; see `mh_score_hist`.
 
 from std.collections import List
 from std.math import floor
+# Parallelism lives in `max` on this toolchain; `std.algorithm` no longer
+# exports `parallelize` (MOJO_NOTES.md section 4).
+from max.algorithm import parallelize
 
 comptime U8Ptr = Pointer[UInt8, AnyOrigin[mut=True]]
 comptime U32Ptr = Pointer[UInt32, AnyOrigin[mut=True]]
@@ -59,6 +62,37 @@ comptime HASH_BLOCKS = 4
 # compare/add pipeline full instead of waiting on a single dependency chain.
 comptime AGREE_ACCS = 8
 
+# Columns hashed per `parallelize` item. The chunk sets both the item count and
+# the load balance; 32 and 64 measured the same in the kernel-only probe
+# (`src/_probe_par.mojo`: 7.2 ms at 4 workers / 4.0 ms at 8 for the 512x4096
+# kernel, either way), so 32 is kept: more items, same time.
+comptime SIG_CHUNK = 32
+
+# ---- parallel thresholds --------------------------------------------------
+#
+# A size gate below which the serial path runs, and a cap on the worker count.
+# Every number here is from a run in this session (2026-11-10, host shared with
+# ~7 other benchmark ports, load 23-64); the tables are in README.md and the
+# harnesses in bench/. Nothing is estimated.
+
+# `mh_signature`, in hash columns * shingles. 4 workers through the bridge:
+# 128x1024 (2**20) is slower parallel (1.43 -> 1.49-2.08 ms); 128x4096 (2**21)
+# is a tie (5.69 vs 5.75 ms) -- 128 columns split into 32-column chunks leave
+# less per item than the synchronisation costs; 256x4096 (2**22) measured
+# 11.4-11.5 serial vs 12.0-12.9 with 2-4 workers at load 23-45, so it is not a
+# proven win either; 512x4096 (2**23) won 1.9-2.4x (23.5 -> 10.3-12.4 ms) in
+# every run. 2**23 units is the crossover that repeated: the gate is the shape
+# that actually wins, not a power of two below it.
+comptime SIG_PARALLEL_MIN = 1 << 23
+# `mh_jaccard_rows` keeps its serial path: no size the port supports won with
+# `parallelize`. See README; effectively disabled so the code path is removable
+# in one line if a larger machine changes the answer.
+comptime JAC_PARALLEL_MIN = 1 << 62
+# Host is shared with other benchmark ports. 8 workers help the kernel-only
+# probe (4.0 vs 7.2 ms) but not end to end, so the shipped cap is 4; a request
+# for fewer (`n_workers == 1`) never reaches `parallelize` at all.
+comptime WORKER_CAP = 4
+
 
 def u8p(addr: Int) -> U8Ptr:
     return U8Ptr(unsafe_from_address=addr)
@@ -84,6 +118,21 @@ def f64p(addr: Int) -> F64Ptr:
     return F64Ptr(unsafe_from_address=addr)
 
 
+def _workers(requested: Int) -> Int:
+    """Effective worker count: `requested` clamped to [1, WORKER_CAP].
+
+    `requested < 1` means "choose it yourself", which resolves to WORKER_CAP.
+    """
+    var n = WORKER_CAP
+    if requested >= 1:
+        n = requested
+    if n > WORKER_CAP:
+        n = WORKER_CAP
+    if n < 1:
+        n = 1
+    return n
+
+
 def _limbs(v: UInt64, p16: UInt64, p32: UInt64, p48: UInt64) -> UInt64:
     """`v mod prime` for a prime near 2**32, without any intermediate over 2**51.
 
@@ -101,22 +150,29 @@ def _limbs(v: UInt64, p16: UInt64, p32: UInt64, p48: UInt64) -> UInt64:
 
 
 def _signature_one(x: U32Ptr, a: UInt64, b: UInt64, c: UInt64, p16: UInt64,
-                   p32: UInt64, p48: UInt64, n: Int) -> UInt64:
+                   p32: UInt64, p48: UInt64, n: Int, s0: Int) -> UInt64:
     var best = UInt64(0xFFFFFFFFFFFFFFFF)
-    for s in range(n):
+    for s in range(s0, n):
         best = min(best, _limbs(a * UInt64(x[unsafe_offset=s]) + b, p16, p32, p48) % c)
     return best
 
 
 def _signature_block(x: U32Ptr, co: I64Ptr, res: U64Ptr, h0: Int, h1: Int,
-                     n: Int, c: UInt64, p16: UInt64, p32: UInt64, p48: UInt64):
-    """Hashes [h0, h1) of `mh_signature`, HASH_BLOCKS columns at a time.
+                     n: Int, c: UInt64, p16: UInt64, p32: UInt64, p48: UInt64,
+                     s0: Int):
+    """Hashes [h0, h1) of `mh_signature` over shingles [s0, n), HASH_BLOCKS at a time.
 
     The coefficients and the running minimum of each column are hoisted out of
     the shingle loop, and each shingle is loaded once and reused by all
     HASH_BLOCKS chains. (A `comptime`-unrolled column loop was tried here and
     measured slower at h=128 and h=256: the emitted body was identical, so it
     only cost the constant array loads.)
+
+    `s0` starts the shingle walk part-way in (the parallel path only); the
+    caller passes 0 for the serial path. The column minimum over [s0, n) is
+    written to `res`, so a caller that also ran an earlier suffix must write
+    that suffix *first* (jobs run in index order here) for the smaller value to
+    win.
     """
     var h = h0
     while h + HASH_BLOCKS <= h1:
@@ -132,7 +188,7 @@ def _signature_block(x: U32Ptr, co: I64Ptr, res: U64Ptr, h0: Int, h1: Int,
         var best1 = best0
         var best2 = best0
         var best3 = best0
-        for s in range(n):
+        for s in range(s0, n):
             var xs = UInt64(x[unsafe_offset=s])
             best0 = min(best0, _limbs(a0 * xs + b0, p16, p32, p48) % c)
             best1 = min(best1, _limbs(a1 * xs + b1, p16, p32, p48) % c)
@@ -148,7 +204,7 @@ def _signature_block(x: U32Ptr, co: I64Ptr, res: U64Ptr, h0: Int, h1: Int,
             x,
             UInt64(co[unsafe_offset=2 * h]),
             UInt64(co[unsafe_offset=2 * h + 1]),
-            c, p16, p32, p48, n
+            c, p16, p32, p48, n, s0
         )
         h += 1
 
@@ -266,12 +322,26 @@ def mh_shingle_adler32(buf_addr: Int, off_addr: Int, len_addr: Int,
 @export("mh_signature")
 def mh_signature(shingles_addr: Int, coeffs_addr: Int, n_shingles: Int,
                  n_hash: Int, prime: Int, out_addr: Int, h0: Int,
-                 h1: Int) abi("C"):
+                 h1: Int, n_workers: Int) abi("C"):
     """Per-hash minimum: out[h] = min_s (a[h] * x[s] + b[h]) % prime, h in [h0, h1).
 
     `coeffs` is interleaved [a0, b0, a1, b1, ...] as Int64. Every operand is
     below 2^32, so `a * x + b` is below 2^64 and the 16-bit limb reduction
     reproduces CPython's arbitrary-precision residue exactly.
+
+    Columns are independent, so above SIG_PARALLEL_MIN hash*shingle units the
+    range [h0, h1) is split into contiguous column chunks of `SIG_CHUNK`
+    (capped at one chunk per worker), one `parallelize` item each, and every
+    chunk writes only its own `out[h]` slots. A chunk is hashed by exactly the
+    same `_signature_block` the serial path uses, so the output is bit-identical
+    to the serial call (tests/test_parallel.py) whatever order the pool runs the
+    items in. Below the threshold, or with `n_workers < 2`, the serial path runs
+    unchanged.
+
+    A finer split was tried and reverted: slicing each column block's shingle
+    range as well, to even out the tail, needs a min-reduction across workers
+    and this toolchain's `Pointer` has no atomic, and `parallelize` offers no
+    reduction argument; the column split alone is enough (README numbers).
     """
     var x = u32p(shingles_addr)
     var co = i64p(coeffs_addr)
@@ -282,24 +352,73 @@ def mh_signature(shingles_addr: Int, coeffs_addr: Int, n_shingles: Int,
     var p32 = (p16 * p16) % c
     var p48 = (p32 * p16) % c
 
+    var workers = _workers(n_workers)
+    var n_cols = h1 - h0
+    if workers > 1 and n_cols >= workers \
+            and (n_cols * n_shingles) >= SIG_PARALLEL_MIN:
+        var per = (n_cols + workers - 1) // workers
+        if per < SIG_CHUNK:
+            per = SIG_CHUNK
+        var n_chunks = (n_cols + per - 1) // per
+        var lo0 = h0
+        if lo0 < 0:
+            lo0 = 0
+
+        def chunk(k: Int) {imm}:
+            var lo = lo0 + k * per
+            var hi = min(lo + per, h1)
+            _signature_block(x, co, res, lo, hi, n_shingles, c, p16, p32, p48, 0)
+
+        parallelize(chunk, n_chunks, workers)
+        return
+
     if h0 <= 0:
-        _signature_block(x, co, res, 0, h1, n_shingles, c, p16, p32, p48)
+        _signature_block(x, co, res, 0, h1, n_shingles, c, p16, p32, p48, 0)
     else:
-        _signature_block(x, co, res, h0, h1, n_shingles, c, p16, p32, p48)
+        _signature_block(x, co, res, h0, h1, n_shingles, c, p16, p32, p48, 0)
 
 
 @export("mh_jaccard_rows")
 def mh_jaccard_rows(sig_addr: Int, n_docs: Int, sig_len: Int, i0: Int, i1: Int,
-                    out_addr: Int) abi("C"):
+                    out_addr: Int, n_workers: Int) abi("C"):
     """Upper-triangular signature agreement for rows [i0, i1).
 
     Row i holds `count(sig[i] == sig[j]) / sig_len` for j in (i, n_docs), laid
     out with a fixed stride of `n_docs` so the rows stay at constant offsets.
     The count is an exact integer comparison; only the final division is float.
+
+    The parallel path is present but gated off (`JAC_PARALLEL_MIN`). It was
+    measured and lost: at 700x64 and 900x128 `parallelize` was never faster than
+    the serial loop, and the column-tiled `_agree` is itself the reason -- it is
+    already memory-bound at the machine's streaming ceiling, so extra workers
+    contend for bandwidth instead of adding throughput. A row split is kept
+    below (rows [i0, i1) in contiguous chunks, each writing only its own row, so
+    chunks share no output element) because it is exact and costs nothing when
+    the gate is closed; raise JAC_PARALLEL_MIN on a machine where it wins.
     """
     var sig = i64p(sig_addr)
     var res = f64p(out_addr)
     var denom = Float64(sig_len)
+    var workers = _workers(n_workers)
+    var n_rows = i1 - i0
+    if workers > 1 and n_rows >= workers \
+            and (n_docs * sig_len) >= JAC_PARALLEL_MIN:
+        var step = (n_rows + workers - 1) // workers
+        var n_chunks = (n_rows + step - 1) // step
+
+        def chunk(k: Int) {imm}:
+            var lo = i0 + k * step
+            var hi = min(lo + step, i1)
+            for i in range(lo, hi):
+                var row = i * n_docs
+                var base_i = i * sig_len
+                for j in range(i + 1, n_docs):
+                    res[unsafe_offset=row + j - i - 1] = (
+                        Float64(_agree(sig, base_i, j * sig_len, sig_len)) / denom
+                    )
+
+        parallelize(chunk, n_chunks, workers)
+        return
 
     for i in range(i0, i1):
         var row = i * n_docs
@@ -346,6 +465,11 @@ def mh_score_hist(scores_addr: Int, n: Int, scale: Float64, n_bins: Int,
     The common value -- a finite score in range -- costs one multiply, one
     floor, one cast and one comparison. The negative and the overflow sides are
     one level down and are reached only by scores that are already out of range.
+
+    Not parallelised, by measurement: at n = 7 998 000 the 1/2/4/8-worker
+    timings were 29.5 / 27.6 / 27.1 / 27.5 ms, i.e. inside the run-to-run
+    spread of this shared host, and per-worker counting to stay exact would
+    double the output traffic for that nothing.
     """
     var sc = f64p(scores_addr)
     var out = i64p(out_addr)

@@ -109,7 +109,7 @@ def test_chunked_and_whole_calls_agree():
         chunk = np.full(64, 0xDEADBEEF, dtype=np.uint64)
         _lib.lib.mh_signature(
             shingles.ctypes.data, coeffs.ctypes.data, shingles.size, 64, PRIME,
-            chunk.ctypes.data, lo, hi,
+            chunk.ctypes.data, lo, hi, 1,
         )
         # A call only writes [lo, hi); the sentinel below lo is still in
         # `chunk`, so copying the whole prefix would clobber earlier chunks.
@@ -123,7 +123,7 @@ def test_chunked_and_whole_calls_agree():
         chunk = np.full(64, 0xDEADBEEF, dtype=np.uint64)
         _lib.lib.mh_signature(
             shingles.ctypes.data, coeffs.ctypes.data, shingles.size, 64, PRIME,
-            chunk.ctypes.data, lo, hi,
+            chunk.ctypes.data, lo, hi, 1,
         )
         assert np.all(chunk[:lo] == 0xDEADBEEF)
         assert np.all(chunk[hi:] == 0xDEADBEEF)

@@ -11,7 +11,6 @@ arity of every entry point at load time.
 import ctypes
 import pathlib
 import zlib
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -26,8 +25,8 @@ _F64 = ctypes.c_double
 
 EXPECTED_ARITY = {
     "mh_shingle_adler32": 6,
-    "mh_signature": 8,
-    "mh_jaccard_rows": 6,
+    "mh_signature": 9,
+    "mh_jaccard_rows": 7,
     "mh_score_hist": 5,
 }
 
@@ -55,27 +54,32 @@ def _load():
         )
     lib = ctypes.CDLL(str(_LIB_PATH))
     _bind(lib, "mh_shingle_adler32", [_I64, _I64, _I64, _I64, _I64, _I64])
-    _bind(lib, "mh_signature", [_I64, _I64, _I64, _I64, _I64, _I64, _I64, _I64])
-    _bind(lib, "mh_jaccard_rows", [_I64, _I64, _I64, _I64, _I64, _I64])
+    _bind(lib, "mh_signature", [_I64, _I64, _I64, _I64, _I64, _I64, _I64, _I64, _I64])
+    _bind(lib, "mh_jaccard_rows", [_I64, _I64, _I64, _I64, _I64, _I64, _I64])
     _bind(lib, "mh_score_hist", [_I64, _I64, _F64, _I64, _I64])
     return lib
 
 
 lib = _load()
 
-_POOL = ThreadPoolExecutor(max_workers=8)
+# Worker count the kernel is asked for when the caller asks for more than one.
+# The kernel caps it at its own WORKER_CAP (4) -- this host is shared, and more
+# workers measured slower per worker -- and chooses the serial path itself
+# below its measured size threshold, so a small call never pays a thread launch.
+DEFAULT_WORKERS = 4
 
 
 def _addr(a: np.ndarray) -> int:
     return a.ctypes.data
 
 
-def _chunks(n: int, workers: int) -> list[tuple[int, int]]:
-    if n <= 0:
-        return []
-    workers = max(1, min(workers, n))
-    step = -(-n // workers)
-    return [(i, min(i + step, n)) for i in range(0, n, step)]
+def _workers(workers) -> int:
+    """Pass a caller's worker request to the kernel, as at least one worker.
+
+    The kernel clamps it to its own WORKER_CAP; a value below 1 here would only
+    mean "you choose", which the default already says explicitly.
+    """
+    return max(1, int(workers))
 
 
 def _check_spans(buf, off, tlen) -> None:
@@ -183,7 +187,7 @@ def adler_shinges(words, k: int) -> np.ndarray:
     return adler_shinges_from_spans(buf, off, (ends - off).astype(np.int32), k)
 
 
-def signature(shingles, coeffs, prime: int = PRIME, workers: int = 8) -> np.ndarray:
+def signature(shingles, coeffs, prime: int = PRIME, workers: int = DEFAULT_WORKERS) -> np.ndarray:
     """Per-hash minimum of the universal hash family, as int64.
 
     Matches `minhash.calculate_signature` (upstream line 28,
@@ -195,6 +199,12 @@ def signature(shingles, coeffs, prime: int = PRIME, workers: int = 8) -> np.ndar
     table is flattened to 1-D, the token sequence upstream's `" ".join` would
     consume; an empty `coeffs` returns early because upstream maps over zero
     hash functions.
+
+    `workers` is a request, not a promise: the kernel splits the hash columns
+    across at most `min(workers, 4)` workers only above its measured size
+    threshold, and runs serially below it (or at `workers=1`). The result is
+    identical either way -- the test suite compares serial and parallel on the
+    same input.
     """
     sh = np.asarray(shingles)
     sh = sh.reshape(-1) if sh.ndim > 1 else sh
@@ -219,27 +229,20 @@ def signature(shingles, coeffs, prime: int = PRIME, workers: int = 8) -> np.ndar
     if co.size and (int(co.min()) < 0 or int(co.max()) >= 2**32):
         raise ValueError("coefficients must lie in [0, 2**32)")
     out = np.empty(co.shape[0], dtype=np.uint64)
-    bounds = _chunks(co.shape[0], workers)
-    if not bounds:
-        return out.view(np.int64)
-
-    def run(b):
-        lib.mh_signature(
-            _addr(sh), _addr(co), sh.size, co.shape[0], prime, _addr(out), b[0], b[1]
-        )
-
-    if len(bounds) > 1:
-        list(_POOL.map(run, bounds))
-    else:
-        run(bounds[0])
+    lib.mh_signature(
+        _addr(sh), _addr(co), sh.size, co.shape[0], prime, _addr(out),
+        0, co.shape[0], _workers(workers),
+    )
     return out.view(np.int64)
 
 
-def jaccard_scores(sigs, workers: int = 8) -> list[np.ndarray]:
+def jaccard_scores(sigs, workers: int = DEFAULT_WORKERS) -> list[np.ndarray]:
     """Upper-triangular `approx_jaccard_score` rows for a signature matrix.
 
     Returns `n_docs` float64 rows, where row i covers the documents after i,
-    exactly as the reference builds its `scores` list.
+    exactly as the reference builds its `scores` list. `workers` is passed to
+    the kernel, which splits the rows only above its size threshold; the
+    output is identical either way.
     """
     sig = np.ascontiguousarray(sigs, dtype=np.int64)
     if sig.ndim != 2:
@@ -251,16 +254,9 @@ def jaccard_scores(sigs, workers: int = 8) -> list[np.ndarray]:
         # the kernel and write an undefined double into the output.
         raise ValueError("sigs must have at least one signature position")
     out = np.zeros(n_docs * n_docs, dtype=np.float64)
-    bounds = _chunks(n_docs, workers)
-
-    def run(b):
-        lib.mh_jaccard_rows(_addr(sig), n_docs, sig_len, b[0], b[1], _addr(out))
-
-    if len(bounds) > 1:
-        list(_POOL.map(run, bounds))
-    else:
-        for b in bounds:
-            run(b)
+    lib.mh_jaccard_rows(
+        _addr(sig), n_docs, sig_len, 0, n_docs, _addr(out), _workers(workers)
+    )
     return [out[i * n_docs : i * n_docs + (n_docs - i - 1)] for i in range(n_docs)]
 
 

@@ -154,7 +154,7 @@ def test_mh_signature_exact_over_the_block_and_its_tail():
 
     lib.mh_signature(
         shingles.ctypes.data, coeffs.ctypes.data, shingles.size, n_hash, PRIME,
-        out.ctypes.data, 0, n_hash,
+        out.ctypes.data, 0, n_hash, 1,
     )
     assert out.tolist() == _min_py(shingles, coeffs, 0, n_hash)
 
@@ -174,7 +174,7 @@ def test_mh_signature_hash_counts_around_the_block_width(n_hash):
 
     lib.mh_signature(
         shingles.ctypes.data, coeffs.ctypes.data, shingles.size, n_hash, PRIME,
-        out.ctypes.data, 0, n_hash,
+        out.ctypes.data, 0, n_hash, 1,
     )
     assert out.tolist() == _min_py(shingles, coeffs, 0, n_hash)
 
@@ -195,7 +195,7 @@ def test_mh_signature_writes_only_the_requested_column_range():
     full = np.zeros(n_hash, dtype=np.uint64)
     lib.mh_signature(
         shingles.ctypes.data, coeffs.ctypes.data, shingles.size, n_hash, PRIME,
-        full.ctypes.data, 0, n_hash,
+        full.ctypes.data, 0, n_hash, 1,
     )
 
     sentinel = 0xA5A5A5A5A5A5A5A5
@@ -203,7 +203,7 @@ def test_mh_signature_writes_only_the_requested_column_range():
         part = np.full(n_hash, sentinel, dtype=np.uint64)
         lib.mh_signature(
             shingles.ctypes.data, coeffs.ctypes.data, shingles.size, n_hash, PRIME,
-            part.ctypes.data, lo, hi,
+            part.ctypes.data, lo, hi, 1,
         )
         assert np.all(part[:lo] == sentinel)
         assert np.all(part[hi:] == sentinel)
@@ -226,7 +226,7 @@ def test_mh_jaccard_rows_writes_row_i_at_stride_n_docs():
     out = np.zeros(n_docs * n_docs, dtype=np.float64)
 
     lib.mh_jaccard_rows(
-        sig.ctypes.data, n_docs, sig_len, 0, n_docs, out.ctypes.data
+        sig.ctypes.data, n_docs, sig_len, 0, n_docs, out.ctypes.data, 1
     )
 
     rows = [out[i * n_docs : i * n_docs + (n_docs - i - 1)] for i in range(n_docs)]
@@ -250,14 +250,14 @@ def test_mh_jaccard_rows_row_range_is_honoured():
     n_docs, sig_len = sig.shape
     whole = np.zeros(n_docs * n_docs, dtype=np.float64)
     lib.mh_jaccard_rows(
-        sig.ctypes.data, n_docs, sig_len, 0, n_docs, whole.ctypes.data
+        sig.ctypes.data, n_docs, sig_len, 0, n_docs, whole.ctypes.data, 1
     )
 
     sentinel = -12345.0
     for lo, hi in ((0, 10), (0, 1), (3, 7), (9, 10)):
         part = np.full(n_docs * n_docs, sentinel, dtype=np.float64)
         lib.mh_jaccard_rows(
-            sig.ctypes.data, n_docs, sig_len, lo, hi, part.ctypes.data
+            sig.ctypes.data, n_docs, sig_len, lo, hi, part.ctypes.data, 1
         )
         # Only the strict upper triangle of rows [lo, hi) is live; the
         # diagonal and lower triangle are never written, so they must still

@@ -68,7 +68,7 @@ def generate_hash_funcs(count: int, prime: int = PRIME, seed=None):
     return [(coeffs.pop(), coeffs.pop()) for _ in range(count)]
 
 
-def calculate_signature(shingles, hash_funcs, workers: int = 8) -> np.ndarray:
+def calculate_signature(shingles, hash_funcs, workers: int = _lib.DEFAULT_WORKERS) -> np.ndarray:
     """`[min((a * x + b) % PRIME) for (a, b) in hash_funcs]` as int64.
 
     Equivalent to `minhash.calculate_signature`. Raises ValueError for an empty
@@ -106,7 +106,7 @@ def approx_jaccard_score(a, b, axis: int = 0) -> float:
     return np.count_nonzero(aa == bb, axis) / len(aa)
 
 
-def score_matrix(sigs, workers: int = 8) -> list[np.ndarray]:
+def score_matrix(sigs, workers: int = _lib.DEFAULT_WORKERS) -> list[np.ndarray]:
     """Upper-triangular agreement rows for an (n_docs, sig_len) signature matrix.
 
     Row i holds the score of document i against every document after it, which
