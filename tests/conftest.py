@@ -13,3 +13,7 @@ if not _LIB.exists():
         "libmojo-minhash.so not built; run `bash build/build.sh`",
         allow_module_level=True,
     )
+
+# Fixtures used by more than one test module live in parity_helpers and are
+# registered here, where pytest always discovers them.
+from parity_helpers import coeffs_json_cleanup  # noqa: E402,F401

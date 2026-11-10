@@ -14,13 +14,14 @@ has crossed the ABI. An out-of-range value is an out-of-bounds read, not an
 exception, so every one of these has to be caught in Python.
 """
 
+import random
+
 import numpy as np
 import pytest
 
 import minhash as ref
 import mojo_minhash as mh
 from mojo_minhash import _lib
-
 
 # --------------------------------------------------------------------------
 # Empty inputs must not reach the kernels with a degenerate shape
@@ -256,9 +257,17 @@ def test_generate_hash_funcs_rejects_an_unusable_prime():
         mh.generate_hash_funcs(2, prime=2**33, seed=0)
 
 
-def test_generate_hash_funcs_still_draws_independently_of_the_prime():
+def test_generate_hash_funcs_still_draws_independently_of_the_prime(coeffs_json_cleanup):
     # Documented behaviour: the draw is a plain random.sample, so the prime
-    # argument cannot change the coefficients.
+    # argument cannot change the coefficients. Checked against upstream's draw
+    # whenever the prime is the upstream default, which is the only prime
+    # upstream's closures can be rebuilt for.
     assert mh.generate_hash_funcs(4, seed=0) == mh.generate_hash_funcs(
         4, prime=12345, seed=0
     )
+    random.seed(0)
+    funcs = ref.generate_hash_funcs(4)
+    prime = ref.generate_hash_funcs.__defaults__[1]
+    assert prime == mh.PRIME
+    recovered = [((fn(1) - fn(0)) % prime, int(fn(0))) for fn in funcs]
+    assert [(int(a), int(b)) for a, b in mh.generate_hash_funcs(4, seed=0)] == recovered

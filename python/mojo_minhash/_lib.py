@@ -131,10 +131,15 @@ def adler_shinges_from_spans(buf, off, tlen, k: int) -> np.ndarray:
 def adler_shinges(words, k: int) -> np.ndarray:
     """Adler-32 of every k-shingle of a token list.
 
-    Returns a uint32 array of length `max(1, len(words) - k + 1)`, matching
-    `minhash.generate_shingles`, which hashes `" ".join(words[i : i + k])`
-    with zlib's adler-32. A document shorter than `k` tokens still yields one
-    shingle covering all of them; an empty list yields adler32(b"") == 1.
+    Matches `minhash.generate_shingles` (upstream 0.1.1, lines 12-17): that
+    function builds `deque(words[:count], maxlen=count)` and hashes
+    `" ".join(memory)`, so it raises ValueError for a negative `count`
+    (maxlen) and TypeError when a token is not a string; `k == 0` is the port's
+    documented deviation (upstream yields adler32(b"") per token).
+
+    Returns a uint32 array of length `max(1, len(words) - k + 1)`. A document
+    shorter than `k` tokens still yields one shingle covering all of them; an
+    empty list yields adler32(b"") == 1.
 
     The token table comes from one join and one vectorised scan for the
     separators rather than one `encode()` per token. `" ".join` is exactly the
@@ -144,8 +149,18 @@ def adler_shinges(words, k: int) -> np.ndarray:
     per-token Python loop, which is invisible in a kernel profile but is the
     dominant cost of `generate_shingles` at document sizes.
     """
-    if k < 1:
+    if words is None:
+        words = []
+    if not isinstance(k, int) or k < 1:
+        # minhash.generate_shingles builds `deque(words[:count], maxlen=count)`,
+        # whose negative maxlen raises ValueError ("maxlen must be
+        # non-negative"); k == 0 is the port's documented deviation.
         raise ValueError("k must be >= 1")
+    if isinstance(words, str):
+        # The reference slices and `" ".join`s it, so "abc" is three tokens.
+        words = list(words)
+    if not isinstance(words, (list, tuple)):
+        words = list(words)
     if not words:
         return np.array([zlib.adler32(b"")], dtype=np.uint32)
     joined = " ".join(words)
@@ -171,11 +186,24 @@ def adler_shinges(words, k: int) -> np.ndarray:
 def signature(shingles, coeffs, prime: int = PRIME, workers: int = 8) -> np.ndarray:
     """Per-hash minimum of the universal hash family, as int64.
 
-    `coeffs` is an (n_hash, 2) int64 array of (a, b) pairs. Raises ValueError
-    on an empty shingle list, matching `min()` on an empty sequence.
+    Matches `minhash.calculate_signature` (upstream line 28,
+    `np.array([min(map(hash, shingles)) for hash in hash_funcs])`): an empty
+    shingle list raises ValueError from `min()`, and an empty `hash_funcs`
+    returns an empty array without reading the shingles.
+
+    `coeffs` is an (n_hash, 2) int64 array of (a, b) pairs. A 2-D shingle
+    table is flattened to 1-D, the token sequence upstream's `" ".join` would
+    consume; an empty `coeffs` returns early because upstream maps over zero
+    hash functions.
     """
     sh = np.asarray(shingles)
-    co = np.ascontiguousarray(coeffs, dtype=np.int64)
+    sh = sh.reshape(-1) if sh.ndim > 1 else sh
+    co = np.asarray(coeffs)
+    if co.size == 0:
+        # minhash.calculate_signature maps over zero hash functions and returns
+        # an empty array without touching the shingles.
+        return np.zeros(0, dtype=np.int64)
+    co = np.ascontiguousarray(co, dtype=np.int64)
     if sh.ndim != 1 or co.ndim != 2 or co.shape[1] != 2:
         raise ValueError("expected a 1-D shingle array and an (n, 2) coeff array")
     if sh.size == 0:

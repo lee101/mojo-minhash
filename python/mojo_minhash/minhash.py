@@ -72,7 +72,8 @@ def calculate_signature(shingles, hash_funcs, workers: int = 8) -> np.ndarray:
     """`[min((a * x + b) % PRIME) for (a, b) in hash_funcs]` as int64.
 
     Equivalent to `minhash.calculate_signature`. Raises ValueError for an empty
-    shingle list, as `min()` does.
+    shingle list, as `min()` does; an empty `hash_funcs` returns an empty array,
+    as upstream's list comprehension over zero hash functions does.
 
     The modulus is always `PRIME`, matching the only value the reference's
     `__main__` uses; it is not read back off `hash_funcs`, because this API

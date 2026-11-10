@@ -91,3 +91,19 @@ def test_token_counts_around_vector_widths(n_tok):
 def test_k_zero_is_rejected():
     with pytest.raises(ValueError):
         mh.generate_shingles(WORDS, 0)
+
+
+def test_negative_k_is_rejected_with_upstreams_class():
+    # minhash.generate_shingles: `deque(words[:count], maxlen=count)` raises
+    # ValueError for a negative maxlen, so the port raises the same class.
+    with pytest.raises(ValueError, match="k must be >= 1"):
+        mh.generate_shingles(WORDS, -1)
+
+
+def test_a_string_is_sliced_into_tokens_like_upstream_does():
+    # minhash.generate_shingles slices and " ".join"s its first argument, so a
+    # str is a sequence of one-character tokens there too.
+    for k in (1, 2, 3):
+        assert mh.generate_shingles("the fox", k).tolist() == _ref_shingles(
+            "the fox", k
+        ).tolist()
