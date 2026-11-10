@@ -265,6 +265,30 @@ Reading the numbers honestly:
   with other benchmark ports. Treat the thread-scaling rows as a lower bound.
 
 
+### GPU phase: CPU only: memory-bound
+
+No kernel in this port gets a GPU path. The gate is the measured flops-per-byte
+column in `bench/analysis.md` §5 (candidates must exceed roughly 2 flops/byte),
+and every kernel is below it:
+
+| kernel | size | flops/byte | measured limiter |
+| --- | --- | ---: | --- |
+| `mh_signature` | h=128, s=4096 | 9.9 nominal, ~250 compulsory | 86 MB/s of a 17 GB/s ceiling — L1-resident, serial 64-bit `mod`. The working set is 19 KiB, so there is no traffic to move to a device, and the 64-bit integer modulo is emulated on the GPU. Not a candidate despite the ratio: it is compute-bound on an op the GPU does badly, not bandwidth-bound. |
+| `mh_score_hist` | n=7 998 000 | 0.62 | dependent scatter, latency-bound at 1.67 GB/s |
+| `mh_jaccard_rows` | 400×64 / 700×64 | 0.13 | at the 17.7–17.9 GB/s host ceiling — pure streaming |
+| `mh_shingle_adler32` | 20000 tok, k=5 | 1.0 | per-token `mod 65521` at 890 MB/s |
+
+The shared GPU itself would have passed: `nvidia-smi --query-gpu=memory.free`
+reported **5101 MiB** free (threshold 4000 MiB) on 2026-11-10. The phase was
+skipped on the compute gate, not on device availability, so there is no device
+allocation, no `max.gpu` kernel and no GPU test to skip — the CPU path is the
+only path and the existing suite covers it. No before/after numbers exist because
+nothing was changed.
+
+**CPU only: memory-bound.** (`mh_signature` is the one compute-bound kernel, and
+its cost is a serial 64-bit divide over an L1-resident 19 KiB working set — the
+transfer would exceed the work.)
+
 ## How it works
 
 `src/kernels.mojo` is a single compilation unit with four `abi("C")` exports.
